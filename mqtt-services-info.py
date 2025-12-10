@@ -5,75 +5,155 @@ import time
 import socket
 import subprocess
 import ssl
-from datetime import datetime, timezone
-import dateutil.parser 
+from datetime import datetime, timezone, timedelta
+import dateutil.parser
 from dotenv import load_dotenv
 import paho.mqtt.client as mqtt
+import pwd
 
-# Load variables from .env file
+# Load environment variables from the .env file
 load_dotenv()
 
-# --- MQTT Config & Environment ---
+# --- MQTT Configuration & Environment Settings ---
 MQTT_BROKER = os.getenv("MQTT_BROKER")
 MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
 MQTT_USER = os.getenv("MQTT_USER")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
 SERVER_NAME = os.getenv("SERVER_NAME", socket.gethostname())
+# Check if SSL is enabled
 MQTT_SSL = os.getenv("MQTT_SSL", "0") == "1"
 
-# Read both system and user services from the environment file
+# Read both system and user services from the environment file, filtering empty entries
 MONITORED_SERVICES = [s.strip() for s in os.getenv("MONITORED_SERVICES", "").split(',') if s.strip()]
-MONITORED_USER_SERVICES = [s.strip() for s in os.getenv("MONITORED_USER_SERVICES", "").split(',') if s.strip()]
+MONITORED_USER_SERVICES_RAW = [s.strip() for s in os.getenv("MONITORED_USER_SERVICES", "").split(',') if s.strip()]
 
-# The base MQTT topic path
+# Parse user services: 'user:service' or 'service' -> (service, user)
+def parse_user_services(raw_list):
+    """
+    Processes raw user service strings into (service_name, username) tuples.
+    If 'username:service_name' format is used, it takes the specified user.
+    If only 'service_name' is used, it defaults to the SUDO_USER environment variable.
+    """
+    parsed = []
+    # Determine the default user if none is specified (the user who executed 'sudo')
+    default_user = os.getenv("SUDO_USER") or "root" 
+    
+    for item in raw_list:
+        if not item:
+            continue
+
+        if ':' in item:
+            # Format: username:service_name
+            username, service_name = item.split(':', 1)
+        else:
+            # Format: service_name (must default to SUDO_USER)
+            username = default_user
+            service_name = item
+        
+        # Verify the user exists on the system before attempting to monitor
+        try:
+            pwd.getpwnam(username)
+            parsed.append((service_name, username))
+        except KeyError:
+            print(f"Warning: User '{username}' for service '{service_name}' not found on the system. Skipping this service.")
+    return parsed
+
+# The processed list of user services: [(service_name, username), ...]
+MONITORED_USER_SERVICES = parse_user_services(MONITORED_USER_SERVICES_RAW)
+
+# The base MQTT topic path for all service data
 MQTT_BASE_TOPIC = f"{SERVER_NAME}/service"
 
-# --- Core Functions (Details retrieval remains unchanged) ---
+# --- Core Functions: Service Details Retrieval ---
 
-def get_service_details(service_name, scope="system"):
+def get_service_details(service_name, scope="system", username=None):
     """
-    Retrieves the status, structured attributes (PID, memory, uptime), and 
-    last log entries (5 lines) for a given service.
-    Works for both 'system' (default) and 'user' scopes.
+    Retrieves the status, structured attributes, and last log entries for a systemd unit.
+
+    For 'user' scope, this function now explicitly sets the XDG_RUNTIME_DIR 
+    to ensure systemctl --user can connect to the user's running session.
+
+    Args:
+        service_name (str): The name of the systemd unit (e.g., 'nginx').
+        scope (str): The scope ('system' or 'user').
+        username (str): The user of the user service (only relevant for scope='user').
+
+    Returns:
+        dict: A dictionary containing 'status' and 'attributes'.
     """
     details = {
         "status": "unknown",
-        "attributes": {},
+        "attributes": {
+            "service_name": service_name,
+        },
         "logs_raw": []
     }
-    
-    # Determine the systemctl command base based on the scope
-    cmd_base = ["systemctl"]
-    if scope == "user":
-        cmd_base.append("--user") # Add --user flag for user services
+
+    # Default commands for system scope
+    cmd_show = ["systemctl", "show", service_name]
+    cmd_logs = ["journalctl", "-u", service_name, "-n", "5", "--no-pager", "--output=short-iso"]
+
+    if scope == "user" and username:
+        try:
+            # Get the numerical User ID (UID)
+            user_info = pwd.getpwnam(username)
+            user_uid = user_info.pw_uid
+
+            # Construct the essential environment variables (DBus/Systemd User Session)
+            # The XDG_RUNTIME_DIR is typically /run/user/<UID>
+            xdg_runtime_dir = f"/run/user/{user_uid}"
+
+            # CRUCIAL FIX: Explicitly set the environment variables within the shell command
+            # The systemctl --user needs these to connect to the session of the user (PID 1120 in your case)
+            env_vars = (
+                f"XDG_RUNTIME_DIR='{xdg_runtime_dir}' "
+                f"DBUS_SESSION_BUS_ADDRESS='unix:path={xdg_runtime_dir}/bus' "
+            )
+
+            # Build shell commands including the --user flag and environment variables
+            shell_command_show = f"{env_vars} systemctl --user show {service_name}"
+            shell_command_logs = f"{env_vars} journalctl --user -u {service_name} -n 5 --no-pager --output=short-iso"
+            
+            # The actual command list passed to subprocess.check_output (wrapped in sudo -u)
+            cmd_show = ["sudo", "-u", username, "sh", "-c", shell_command_show]
+            cmd_logs = ["sudo", "-u", username, "sh", "-c", shell_command_logs]
+
+        except KeyError:
+             details["status"] = "user_not_found_on_system"
+             details["attributes"]["LastLogs"] = f"User '{username}' does not exist on the system."
+             return details
+        except Exception as e:
+             details["status"] = "user_env_error"
+             details["attributes"]["LastLogs"] = f"Error setting up environment for user '{username}': {e}"
+             return details
+
 
     # 1. Retrieve structured attributes using systemctl show
     try:
-        cmd_show = cmd_base + ["show", service_name]
         output = subprocess.check_output(
             cmd_show,
             stderr=subprocess.DEVNULL,
             text=True,
             timeout=5
         )
-        
+
         systemctl_data = {}
         for line in output.strip().split('\n'):
             if '=' in line:
                 key, value = line.split('=', 1)
                 systemctl_data[key] = value
 
-        # Determine the primary status
+        # Determine the primary status from systemd ActiveState
         active_state = systemctl_data.get("ActiveState", "unknown")
-        
+
         if active_state == "active":
             details["status"] = "running"
         elif active_state in ["inactive", "failed"]:
             details["status"] = "stopped"
         else:
-             details["status"] = active_state
+            details["status"] = active_state
 
-        # Populate attributes
+        # Populate attributes dictionary
         details["attributes"]["UnitFileState"] = systemctl_data.get("UnitFileState", "N/A")
         details["attributes"]["SubState"] = systemctl_data.get("SubState", "N/A")
         details["attributes"]["MainPID"] = systemctl_data.get("ExecMainPID", "N/A")
@@ -82,8 +162,9 @@ def get_service_details(service_name, scope="system"):
         if systemctl_data.get("ActiveEnterTimestamp"):
             try:
                 dt_active = dateutil.parser.parse(systemctl_data["ActiveEnterTimestamp"])
+                # Calculate the difference between now (UTC) and activation time (UTC)
                 time_diff = datetime.now(timezone.utc) - dt_active.astimezone(timezone.utc).replace(tzinfo=None)
-                
+
                 total_seconds = int(time_diff.total_seconds())
                 days = total_seconds // 86400
                 hours = (total_seconds % 86400) // 3600
@@ -92,32 +173,29 @@ def get_service_details(service_name, scope="system"):
             except Exception:
                 details["attributes"]["ActiveSince"] = systemctl_data["ActiveEnterTimestamp"]
         else:
-             details["attributes"]["ActiveSince"] = "N/A"
+            details["attributes"]["ActiveSince"] = "N/A"
 
-        # Memory (reported by systemd in bytes)
+        # Memory usage (reported by systemd in bytes)
         mem_bytes = systemctl_data.get("MemoryCurrent", None)
         if mem_bytes and mem_bytes.isdigit():
+            # Convert bytes to megabytes (MiB)
             details["attributes"]["MemoryUsage"] = f"{int(mem_bytes) / (1024*1024):.2f} MB"
         else:
             details["attributes"]["MemoryUsage"] = "N/A"
-            
-    except subprocess.CalledProcessError as e:
-        # Service could not be found (exit code > 0)
+
+    except subprocess.CalledProcessError:
+        # Service unit could not be found or accessed (exit code > 0)
         details["status"] = "not_found"
-        details["attributes"]["LastLogs"] = "Unit could not be found."
+        details["attributes"]["LastLogs"] = "Unit could not be found or accessed."
         return details
     except Exception:
-        # General error retrieving details
+        # General error during retrieval
         details["status"] = "error"
         details["attributes"]["LastLogs"] = "General error retrieving details."
-        pass 
+        pass
 
     # 2. Retrieve the last 5 log lines using journalctl
     try:
-        cmd_logs = ["journalctl", "-u", service_name, "-n", "5", "--no-pager", "--output=short-iso"]
-        if scope == "user":
-            cmd_logs.insert(1, "--user") # Add --user flag for user journalctl
-
         log_output = subprocess.check_output(
             cmd_logs,
             stderr=subprocess.DEVNULL,
@@ -126,66 +204,66 @@ def get_service_details(service_name, scope="system"):
         )
         details["attributes"]["LastLogs"] = log_output.strip()
     except Exception:
+        # Only set log error if primary status retrieval succeeded
         if details["status"] not in ["not_found", "error"]:
             details["attributes"]["LastLogs"] = "Logs could not be retrieved (journalctl error)."
-    
+
     return details
 
 
 def collect_all_service_details():
     """Retrieves details for all configured system and user services."""
     all_details = {}
-    
-    # System services
+
+    # Collect details for System services
     for service in MONITORED_SERVICES:
-        key = f"{service}_system" 
+        key = f"{service}_system"
         details = get_service_details(service, scope="system")
-        details["service_name"] = service
-        details["scope"] = "system"
+        details["scope"] = "system" # Add scope outside of attributes for internal logic
         all_details[key] = details
 
-    # User services
-    for service in MONITORED_USER_SERVICES:
-        key = f"{service}_user"
-        details = get_service_details(service, scope="user")
-        details["service_name"] = service
-        details["scope"] = "user"
+    # Collect details for User services
+    for service_name, username in MONITORED_USER_SERVICES:
+        key = f"{service_name}_{username}_user"
+        details = get_service_details(service_name, scope="user", username=username)
+        details["scope"] = "user" # Add scope outside of attributes for internal logic
+        details["username"] = username # Add username for publishing logic
         all_details[key] = details
-        
+
     return all_details
 
 
 def publish_auto_discovery(client):
     """
     Publishes Home Assistant MQTT Auto Discovery configuration for all
-    individual services and the failure counter sensor.
+    individual service sensors and the global failure counter sensor.
     """
     if not MONITORED_SERVICES and not MONITORED_USER_SERVICES:
         return
 
-    print("Publishing Home Assistant Auto Discovery...")
+    print("Publishing Home Assistant Auto Discovery configurations...")
 
-    def create_discovery_payload(service_name, scope, icon="mdi:watch"):
-        # The MQTT topic used for state publishing MUST be unique for user/system
-        topic_suffix = f"_{scope}" if scope == "user" else ""
-
-        # De meest unieke identifier voor MQTT (om conflicten te voorkomen)
-        discovery_slug = f"{SERVER_NAME}_{service_name}"
+    def create_discovery_payload(service_name, scope, icon="mdi:watch", username=None):
+        # The state topic MUST be unique for user/system services
+        topic_suffix = f"_{username}_user" if scope == "user" else ""
         
-        # !!! WIJZIGING VOOR GEWENSTE ENTITEITS-ID !!!
-        # sensor.doorman_service_libvirtd
-        object_id = f"{SERVER_NAME}_service_{service_name}" 
+        # Unique identifier used by Home Assistant for internal entity tracking
+        unique_id_slug = f"{SERVER_NAME}_{service_name}_{username}_{scope}" if scope == "user" else f"{SERVER_NAME}_{service_name}_{scope}"
+
+        # Entity ID (name presented to the user): e.g., sensor.myserver_service_daft_user
+        object_id = f"{SERVER_NAME}_service_{service_name}_{username}_user" if scope == "user" else f"{SERVER_NAME}_service_{service_name}_system"
+
+        name_suffix = f" ({username.capitalize()})" if scope == "user" else ""
 
         return {
-            # Display naam bevat nu de scope voor duidelijkheid
-            "name": f"Service {service_name.capitalize()}", 
+            "name": f"{service_name.capitalize()} Service{name_suffix}",
             "state_topic": f"{MQTT_BASE_TOPIC}/{service_name}{topic_suffix}",
-            "value_template": "{{ value_json.status }}", 
+            "value_template": "{{ value_json.status }}",
             "icon": icon,
-            "unique_id": discovery_slug, # Unieke ID (interne HA sleutel): doorman_libvirtd_system
-            "object_id": object_id,      # Entiteits ID (gebruikersnaam): doorman_service_libvirtd
+            "unique_id": unique_id_slug,
+            "object_id": object_id,
             "json_attributes_template": "{{ value_json.attributes | tojson }}",
-            "json_attributes_topic": f"{MQTT_BASE_TOPIC}/{service_name}{topic_suffix}", 
+            "json_attributes_topic": f"{MQTT_BASE_TOPIC}/{service_name}{topic_suffix}",
             "device": {
                 "identifiers": [SERVER_NAME],
                 "name": SERVER_NAME,
@@ -193,30 +271,30 @@ def publish_auto_discovery(client):
                 "model": "MQTT Service Watcher",
             }
         }
-    
+
     # Discovery for System Services
     for service in MONITORED_SERVICES:
         payload = create_discovery_payload(service, "system", "mdi:cogs")
-        # De Discovery Topic moet de UNIQUE SLUG gebruiken om overschrijving te voorkomen
-        discovery_topic = f"homeassistant/sensor/{payload['unique_id']}/config" 
+        discovery_topic = f"homeassistant/sensor/{payload['unique_id']}/config"
         client.publish(discovery_topic, json.dumps(payload), retain=True)
 
     # Discovery for User Services
-    for service in MONITORED_USER_SERVICES:
-        payload = create_discovery_payload(service, "user", "mdi:account-circle")
-        discovery_topic = f"homeassistant/sensor/{payload['unique_id']}/config" 
+    for service_name, username in MONITORED_USER_SERVICES:
+        payload = create_discovery_payload(service_name, "user", "mdi:account-circle", username)
+        discovery_topic = f"homeassistant/sensor/{payload['unique_id']}/config"
         client.publish(discovery_topic, json.dumps(payload), retain=True)
 
     # Discovery for Failed Services Count Sensor
-    failed_sensor_topic = f"homeassistant/sensor/{SERVER_NAME}_failed_services_count/config"
+    failed_sensor_id = f"{SERVER_NAME}_failed_services_count"
+    failed_sensor_topic = f"homeassistant/sensor/{failed_sensor_id}/config"
     failed_payload = {
         "name": f"{SERVER_NAME} Failed Services Count",
         "state_topic": f"{MQTT_BASE_TOPIC}/failed_services_count",
-        "value_template": "{{ value_json.count }}", 
+        "value_template": "{{ value_json.count }}",
         "unit_of_measurement": "services",
         "icon": "mdi:alert-circle",
-        "unique_id": f"{SERVER_NAME}_failed_services_count",
-        "object_id": f"{SERVER_NAME}_failed_services_count",
+        "unique_id": failed_sensor_id,
+        "object_id": failed_sensor_id,
         "json_attributes_template": "{{ value_json.attributes | tojson }}",
         "json_attributes_topic": f"{MQTT_BASE_TOPIC}/failed_services_count",
         "device": {
@@ -228,43 +306,55 @@ def publish_auto_discovery(client):
     }
     client.publish(failed_sensor_topic, json.dumps(failed_payload), retain=True)
 
-    print("Auto Discovery complete. Final Naming Convention: sensor.doorman_service_service_name")
+    print(f"Auto Discovery complete. {len(MONITORED_SERVICES) + len(MONITORED_USER_SERVICES)} entities configured.")
 
 
 def publish_values(client):
-    """Retrieves all details and publishes the full JSON payloads, including the failed count."""
-    
+    """
+    Retrieves all service details, publishes the full JSON payloads to MQTT,
+    and updates the failed service counter.
+    """
+
     all_details = collect_all_service_details()
     failed_services = []
-    
+
     if not all_details:
         print("No services configured to monitor.")
         return
 
     print("-" * 30)
     for key, details in all_details.items():
-        service = details["service_name"]
-        scope = details["scope"] # Hier is de scope (user/system) al bekend
+        service = details["attributes"]["service_name"]
+        scope = details["scope"] # Scope (user/system) is used for topic construction
         
-        # Publish topic is nog steeds uniek (service of service_user)
-        topic_suffix = f"_{scope}" if scope == "user" else ""
+        # Determine the unique topic suffix and add the username if it's a user service
+        if scope == "user":
+            username = details["username"]
+            topic_suffix = f"_{username}_user"
+            service_display = f"{service} (user:{username})"
+        else:
+            topic_suffix = ""
+            service_display = f"{service} (system)"
+
         topic = f"{MQTT_BASE_TOPIC}/{service}{topic_suffix}"
-        
+
+        # Track failed/stopped services for the counter sensor
         if details["status"] not in ["running", "not_found", "unknown"]:
-            failed_services.append(f"{service} ({scope})")
+            failed_services.append(service_display)
 
         payload = {
             "status": details["status"],
             "attributes": details["attributes"]
         }
-        
-        # === DE VEREISTE WIJZIGING: VOEG SCOPE TOE ALS ATTRIBUUT ===
-        payload["attributes"]["scope"] = scope.capitalize() 
-        # ==========================================================
-        
-        json_payload = json.dumps(payload, indent=None) 
 
-        print(f"Service: {service.ljust(15)} ({scope}) -> Status: {details['status'].ljust(8)} -> Topic: {topic} (JSON)")
+        # Add scope and username to the attributes for Home Assistant context
+        payload["attributes"]["scope"] = scope.capitalize()
+        if scope == "user":
+            payload["attributes"]["username"] = username
+
+        json_payload = json.dumps(payload, indent=None)
+
+        print(f"Service: {service_display.ljust(25)} -> Status: {details['status'].ljust(8)} -> Topic: {topic}")
 
         client.publish(topic, json_payload, retain=True)
 
@@ -272,52 +362,55 @@ def publish_values(client):
     failed_count_payload = {
         "count": len(failed_services),
         "attributes": {
-            "fail_services": failed_services 
+            "fail_services": failed_services
         }
     }
     failed_count_topic = f"{MQTT_BASE_TOPIC}/failed_services_count"
-    
+
     client.publish(failed_count_topic, json.dumps(failed_count_payload), retain=True)
     print(f"\nPublished: Total {len(failed_services)} failed services.")
 
 
 def main():
-    """ Main program loop """
+    """Main execution entry point: connects to MQTT and starts the monitoring loop."""
 
     if not MQTT_BROKER:
         print("Error: MQTT_BROKER is not set in the .env file.")
         return
 
-    print(f"--- Service Monitor Start ---")
-    print(f"Server: {SERVER_NAME}")
-    print(f"Broker: {MQTT_BROKER}:{MQTT_PORT}")
-    print(f"SSL Enabled: {'Yes' if MQTT_SSL else 'No'}")
-    print(f"Topics: {MQTT_BASE_TOPIC}/<service>_<scope>")
-    print(f"Services (System): {', '.join(MONITORED_SERVICES) if MONITORED_SERVICES else 'None'}")
-    print(f"Services (User): {', '.join(MONITORED_USER_SERVICES) if MONITORED_USER_SERVICES else 'None'}")
+    print(f"--- Service Monitor Initializing ---")
+    print(f"Server Hostname: {SERVER_NAME}")
+    print(f"MQTT Broker: {MQTT_BROKER}:{MQTT_PORT}")
+    print(f"Secure Connection (TLS): {'Yes' if MQTT_SSL else 'No'}")
+    print(f"Base Topic Path: {MQTT_BASE_TOPIC}/<service>[_<user>_user]")
+    
+    user_services_list = [f'{u}:{s}' if ':' not in s else s for s, u in MONITORED_USER_SERVICES]
+    print(f"Monitored Services (System): {', '.join(MONITORED_SERVICES) if MONITORED_SERVICES else 'None'}")
+    print(f"Monitored Services (User): {', '.join(user_services_list) if user_services_list else 'None'}")
 
-    # Fix for the paho-mqtt ValueError on Debian/older versions:
+    # Initialize MQTT Client (using VERSION1 for compatibility with older paho-mqtt/Debian)
     client = mqtt.Client(
         client_id=f"{SERVER_NAME}_service_monitor",
         callback_api_version=mqtt.CallbackAPIVersion.VERSION1
     )
-    
+
     if MQTT_USER:
         client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
 
-    # --- SSL/TLS Implementation ---
+    # --- Configure SSL/TLS ---
     if MQTT_SSL:
         try:
-            print("Secure connection (TLS) enabled.")
+            print("Configuring secure connection (TLS/SSL)...")
             client.tls_set(
-                cert_reqs=ssl.CERT_NONE, 
+                # Setting cert_reqs to ssl.CERT_NONE for self-signed or unverified certificates
+                cert_reqs=ssl.CERT_NONE,
                 tls_version=ssl.PROTOCOL_TLS
             )
         except Exception as e:
-            print(f"Error setting up TLS: {e}")
+            print(f"Error configuring TLS: {e}")
             return
 
-    # Connect
+    # Establish Connection
     try:
         client.connect(MQTT_BROKER, MQTT_PORT, 60)
     except Exception as e:
@@ -326,22 +419,31 @@ def main():
 
     client.loop_start()
 
+    # Publish Home Assistant Auto Discovery messages once
     publish_auto_discovery(client)
 
+    # Start the continuous monitoring loop
     try:
         while True:
             publish_values(client)
-            time.sleep(20) 
+            time.sleep(20) # Wait 20 seconds before the next check
     except KeyboardInterrupt:
-        print("\nScript stopped by user.")
+        print("\nScript terminated by user (KeyboardInterrupt).")
     finally:
         client.loop_stop()
         client.disconnect()
-        print("MQTT connection closed. Exiting.")
+        print("MQTT connection closed. Exiting application.")
 
 if __name__ == "__main__":
-    from datetime import timedelta 
     try:
+        # Check for root/sudo execution context for user services to work properly
+        if MONITORED_USER_SERVICES and os.geteuid() != 0:
+            print("--- WARNING ---")
+            print("User services (MONITORED_USER_SERVICES) are configured, but the script is not running as root.")
+            print("The 'sudo -u <username>' command will fail unless you run this script via 'sudo python3 your_script.py'.")
+            print("-----------------")
+            time.sleep(2) # Pause briefly to ensure the message is seen
+
         main()
     except Exception as e:
-        print(f"Fatal error in main program: {e}")
+        print(f"Fatal error in main program execution: {e}")
