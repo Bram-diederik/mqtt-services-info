@@ -1,0 +1,10 @@
+# MQTT Broker Details
+MQTT_BROKER=homeassistant
+MQTT_PORT=8883
+MQTT_USER=user
+MQTT_PASSWORD=password
+MQTT_SSL=0
+SERVER_NAME=server_name
+
+MONITORED_SERVICES=ssh,nginx
+MONITORED_USER_SERVICES=snapclient
