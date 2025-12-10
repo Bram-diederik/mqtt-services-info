@@ -1,6 +1,7 @@
 a python script to send service infomation to home assistant.
 for system services and services of the user running the script. 
 
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/72676778-945c-484f-b2d6-f50be056051e" />
 
 
 dynamic card to show failing services. (replace doorman with the name of your server)
