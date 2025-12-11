@@ -15,12 +15,12 @@ filter:
     - options:
         type: custom:template-entity-row
         name: >
-          {{ state_attr(config.entity, 'friendly_name') if
-          state_attr(config.entity, 'friendly_name') else config.entity }} ({{
-          states(config.entity) | capitalize }})
+          {{ state_attr(config.entity, 'service_name') if
+          state_attr(config.entity, 'service_name') else config.entity }}
+          {{ '(' ~state_attr(config.entity, 'scope') ~ ')'  if
+           state_attr(config.entity, 'scope') }}        
         secondary: |
-          {% set logs = state_attr(config.entity, 'LastLogs') %} {% if logs %}
-           
+          {% set logs = state_attr(config.entity, 'LastLogs') %} {% if logs %}           
             {{ logs | regex_replace(find='(^.*]:)', replace='')}}
           {% else %}
             No information available
@@ -33,4 +33,5 @@ filter:
     - options: {}
       state: running
 show_empty: false
+
 ```
