@@ -8,9 +8,9 @@ import ssl
 from datetime import datetime, timezone, timedelta
 import dateutil.parser
 from dotenv import load_dotenv
-import paho.mqtt.client as mqtt
-import pwd
-import re # Nodig voor de saneringsfunctie
+import paho.mqtt.client as mqtt # MQTT library for communication
+import pwd # To look up user details (UID, etc.)
+import re # Needed for sanitization function
 
 # Load environment variables from the .env file
 load_dotenv()
@@ -25,7 +25,7 @@ MQTT_SSL = os.getenv("MQTT_SSL", "0") == "1"
 UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", 60)) 
 MEM_SENSORS = os.getenv("MEM_SENSORS", "0") == "1" 
 
-# Read both system and user services from the environment file, filtering empty entries
+# Read and filter monitored services from environment variables
 MONITORED_SERVICES = [s.strip() for s in os.getenv("MONITORED_SERVICES", "").split(',') if s.strip()]
 MONITORED_USER_SERVICES_RAW = [s.strip() for s in os.getenv("MONITORED_USER_SERVICES", "").split(',') if s.strip()]
 
@@ -37,15 +37,14 @@ MQTT_BASE_TOPIC = f"{SERVER_NAME}/service"
 service_memory_cache = {} 
 
 def sanitize_for_ha_id(name):
-    """Vervangt tekens die problemen geven in HA entity_id's door underscores."""
+    """Replaces characters that cause issues in Home Assistant (HA) entity_id's with underscores."""
     sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', name).lower()
     return sanitized
 
 def parse_user_services(raw_list):
     """
     Processes raw user service strings into (service_name, username) tuples.
-    If 'username:service_name' format is used, it takes the specified user.
-    If only 'service_name' is used, it defaults to the SUDO_USER environment variable.
+    It defaults to the SUDO_USER if the format is just 'service_name'.
     """
     parsed = []
     # Determine the default user if none is specified (the user who executed 'sudo')
@@ -59,7 +58,7 @@ def parse_user_services(raw_list):
             # Format: username:service_name
             username, service_name = item.split(':', 1)
         else:
-            # Format: service_name (must default to SUDO_USER)
+            # Format: service_name (defaults to SUDO_USER)
             username = default_user
             service_name = item
         
@@ -77,7 +76,8 @@ MONITORED_USER_SERVICES = parse_user_services(MONITORED_USER_SERVICES_RAW)
 
 def get_service_details(service_name, scope="system", username=None):
     """
-    Retrieves the status, structured attributes, and last log entries for a systemd unit.
+    Retrieves the status, structured attributes, and last log entries for a systemd unit
+    using 'systemctl' and 'journalctl'. Handles both system and user scopes.
     """
     details = {
         "status": "unknown",
@@ -97,22 +97,25 @@ def get_service_details(service_name, scope="system", username=None):
             user_info = pwd.getpwnam(username)
             user_uid = user_info.pw_uid
 
-            # Construct the essential environment variables (DBus/Systemd User Session)
-            # The XDG_RUNTIME_DIR is typically /run/user/<UID>
+            # Necessary environment variables for a user's systemd session
             xdg_runtime_dir = f"/run/user/{user_uid}"
+            dbus_address = f"unix:path={xdg_runtime_dir}/bus"
 
-            # CRUCIAL FIX: Explicitly set the environment variables within the shell command
-            # The systemctl --user needs these to connect to the session of the user (PID 1120 in your case)
-            env_vars = (
+            # Construct shell commands that set the required environment variables 
+            # (XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS) before executing systemctl --user.
+            # This is essential for accessing user systemd services via 'sudo -u <user>'.
+            shell_command_show = (
                 f"XDG_RUNTIME_DIR='{xdg_runtime_dir}' "
-                f"DBUS_SESSION_BUS_ADDRESS='unix:path={xdg_runtime_dir}/bus' "
+                f"DBUS_SESSION_BUS_ADDRESS='{dbus_address}' "
+                f"systemctl --user show {service_name}"
+            )
+            shell_command_logs = (
+                f"XDG_RUNTIME_DIR='{xdg_runtime_dir}' "
+                f"DBUS_SESSION_BUS_ADDRESS='{dbus_address}' "
+                f"journalctl --user -u {service_name} -n 5 --no-pager --output=short-iso"
             )
 
-            # Build shell commands including the --user flag and environment variables
-            shell_command_show = f"{env_vars} systemctl --user show {service_name}"
-            shell_command_logs = f"{env_vars} journalctl --user -u {service_name} -n 5 --no-pager --output=short-iso"
-            
-            # The actual command list passed to subprocess.check_output (wrapped in sudo -u)
+            # Commands are executed via 'sudo -u <user> sh -c "<shell command>"'
             cmd_show = ["sudo", "-u", username, "sh", "-c", shell_command_show]
             cmd_logs = ["sudo", "-u", username, "sh", "-c", shell_command_logs]
 
@@ -244,7 +247,8 @@ def collect_all_service_details():
 def publish_auto_discovery(client):
     """
     Publishes Home Assistant MQTT Auto Discovery configuration for all
-    individual service sensors and the global failure counter sensor.
+    individual service sensors (status and optional memory) and the global 
+    failure counter sensor.
     """
     if not MONITORED_SERVICES and not MONITORED_USER_SERVICES:
         return
@@ -290,7 +294,7 @@ def publish_auto_discovery(client):
                 "json_attributes_topic": state_topic,
             }
 
-        # Common Device Information
+        # Common Device Information for Home Assistant
         payload["device"] = {
             "identifiers": [SERVER_NAME],
             "name": SERVER_NAME,
@@ -370,7 +374,6 @@ def publish_values(client):
             username = details["username"]
             topic_suffix = f"_{username}_user"
             service_display = f"{service} (user:{username})"
-            # Use the full key for memory cache lookup
             mem_cache_key = key 
         else:
             topic_suffix = ""
@@ -410,7 +413,7 @@ def publish_values(client):
                 client.publish(mem_topic, f"{mem_value:.2f}", retain=True)
                 print(f"  Memory: {mem_value:.2f} MiB -> Topic: {mem_topic}")
             else:
-                # Publish 'unavailable' if value is not set (e.g., service stopped or error)
+                # Publish 'unavailable' if value is not set
                 client.publish(mem_topic, "unavailable", retain=True)
                 print(f"  Memory: Unavailable -> Topic: {mem_topic}")
 
@@ -439,21 +442,22 @@ def main():
     print(f"Server Hostname: {SERVER_NAME}")
     print(f"MQTT Broker: {MQTT_BROKER}:{MQTT_PORT}")
     print(f"Secure Connection (TLS): {'Yes' if MQTT_SSL else 'No'}")
-    print(f"Base Topic Path (Services): {MQTT_BASE_TOPIC}/<service>[_<user>_user]")
     
-    print(f"Update Interval: {UPDATE_INTERVAL} seconds") 
-    
-    user_services_list = [f'{u}:{s}' if ':' not in s else s for s, u in MONITORED_USER_SERVICES]
+    # Show configured services
+    user_services_list = [f'{u}:{s}' for s, u in MONITORED_USER_SERVICES]
     print(f"Monitored Services (System): {', '.join(MONITORED_SERVICES) if MONITORED_SERVICES else 'None'}")
     print(f"Monitored Services (User): {', '.join(user_services_list) if user_services_list else 'None'}")
-    print(f"Service Memory Sensors (Home Assistant): {'Enabled' if MEM_SENSORS else 'Disabled'}")
-
-
-    # Initialize MQTT Client (using VERSION1 for compatibility with older paho-mqtt/Debian)
-    client = mqtt.Client(
-        client_id=f"{SERVER_NAME}_service_monitor",
-        callback_api_version=mqtt.CallbackAPIVersion.VERSION1
-    )
+    
+    
+    # Initialize MQTT Client with backwards compatibility for paho-mqtt versions.
+    # This dynamic check ensures the code runs on older paho-mqtt versions (common on Debian) 
+    # and newer versions (common on Ubuntu/modern systems).
+    client_kwargs = {"client_id": f"{SERVER_NAME}_service_monitor"}
+    if hasattr(mqtt, 'CallbackAPIVersion'):
+        # Use modern API version if supported
+        client_kwargs['callback_api_version'] = mqtt.CallbackAPIVersion.VERSION2
+    
+    client = mqtt.Client(**client_kwargs)
 
     if MQTT_USER:
         client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
