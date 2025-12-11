@@ -10,6 +10,7 @@ import dateutil.parser
 from dotenv import load_dotenv
 import paho.mqtt.client as mqtt
 import pwd
+import re # Nodig voor de saneringsfunctie
 
 # Load environment variables from the .env file
 load_dotenv()
@@ -35,7 +36,11 @@ MQTT_BASE_TOPIC = f"{SERVER_NAME}/service"
 # Key: 'service_name_scope' -> Value: 'memory_in_mib'
 service_memory_cache = {} 
 
-# Parse user services: 'user:service' or 'service' -> (service, user)
+def sanitize_for_ha_id(name):
+    """Vervangt tekens die problemen geven in HA entity_id's door underscores."""
+    sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', name).lower()
+    return sanitized
+
 def parse_user_services(raw_list):
     """
     Processes raw user service strings into (service_name, username) tuples.
@@ -70,22 +75,9 @@ def parse_user_services(raw_list):
 MONITORED_USER_SERVICES = parse_user_services(MONITORED_USER_SERVICES_RAW)
 
 
-# --- Core Functions: Service Details Retrieval ---
-
 def get_service_details(service_name, scope="system", username=None):
     """
     Retrieves the status, structured attributes, and last log entries for a systemd unit.
-
-    For 'user' scope, this function now explicitly sets the XDG_RUNTIME_DIR 
-    to ensure systemctl --user can connect to the user's running session.
-
-    Args:
-        service_name (str): The name of the systemd unit (e.g., 'nginx').
-        scope (str): The scope ('system' or 'user').
-        username (str): The user of the user service (only relevant for scope='user').
-
-    Returns:
-        dict: A dictionary containing 'status' and 'attributes'.
     """
     details = {
         "status": "unknown",
@@ -235,15 +227,15 @@ def collect_all_service_details():
     for service in MONITORED_SERVICES:
         key = f"{service}_system"
         details = get_service_details(service, scope="system")
-        details["scope"] = "system" # Add scope outside of attributes for internal logic
+        details["scope"] = "system" 
         all_details[key] = details
 
     # Collect details for User services
     for service_name, username in MONITORED_USER_SERVICES:
         key = f"{service_name}_{username}_user"
         details = get_service_details(service_name, scope="user", username=username)
-        details["scope"] = "user" # Add scope outside of attributes for internal logic
-        details["username"] = username # Add username for publishing logic
+        details["scope"] = "user" 
+        details["username"] = username 
         all_details[key] = details
 
     return all_details
@@ -261,12 +253,12 @@ def publish_auto_discovery(client):
 
     def create_discovery_payload(service_name, scope, icon="mdi:watch", username=None, is_memory_sensor=False):
         
-        # Determine unique identifiers
+        sanitized_service_name = sanitize_for_ha_id(service_name)
+        
         topic_suffix = f"_{username}_user" if scope == "user" else ""
-        service_id_part = f"{service_name}_{username}" if scope == "user" else service_name
+        service_id_part = f"{sanitized_service_name}_{username}" if scope == "user" else sanitized_service_name
         name_suffix = f" ({username.capitalize()})" if scope == "user" else ""
         
-        # Sensor specific configuration
         if is_memory_sensor:
             unique_id_slug = f"{SERVER_NAME}_mem_service_{service_id_part}_{scope}"
             object_id = f"{SERVER_NAME}_mem_service_{service_id_part}"
@@ -283,8 +275,8 @@ def publish_auto_discovery(client):
                 "object_id": object_id,
             }
         else:
-            unique_id_slug = f"{SERVER_NAME}_{service_name}_{username}_{scope}" if scope == "user" else f"{SERVER_NAME}_{service_name}_{scope}"
-            object_id = f"{SERVER_NAME}_service_{service_name}_{username}_user" if scope == "user" else f"{SERVER_NAME}_service_{service_name}_system"
+            unique_id_slug = f"{SERVER_NAME}_service_{service_id_part}_{scope}"
+            object_id = f"{SERVER_NAME}_service_{service_id_part}_{scope}"
             state_topic = f"{MQTT_BASE_TOPIC}/{service_name}{topic_suffix}"
             
             payload = {
@@ -329,7 +321,7 @@ def publish_auto_discovery(client):
             client.publish(discovery_topic_mem, json.dumps(payload_mem), retain=True)
             total_entities += 1
             
-    # Discovery for Failed Services Count Sensor (Geen wijziging)
+    # Discovery for Failed Services Count Sensor
     failed_sensor_id = f"{SERVER_NAME}_failed_services_count"
     failed_sensor_topic = f"homeassistant/sensor/{failed_sensor_id}/config"
     failed_payload = {
@@ -449,7 +441,7 @@ def main():
     print(f"Secure Connection (TLS): {'Yes' if MQTT_SSL else 'No'}")
     print(f"Base Topic Path (Services): {MQTT_BASE_TOPIC}/<service>[_<user>_user]")
     
-    print(f"Update Interval: {UPDATE_INTERVAL} seconds") # Print the interval
+    print(f"Update Interval: {UPDATE_INTERVAL} seconds") 
     
     user_services_list = [f'{u}:{s}' if ':' not in s else s for s, u in MONITORED_USER_SERVICES]
     print(f"Monitored Services (System): {', '.join(MONITORED_SERVICES) if MONITORED_SERVICES else 'None'}")
@@ -511,7 +503,7 @@ if __name__ == "__main__":
             print("User services (MONITORED_USER_SERVICES) are configured, but the script is not running as root.")
             print("The 'sudo -u <username>' command will fail unless you run this script via 'sudo python3 your_script.py'.")
             print("-----------------")
-            time.sleep(2) 
+            time.sleep(2) # Pause briefly to ensure the message is seen
 
         main()
     except Exception as e:
