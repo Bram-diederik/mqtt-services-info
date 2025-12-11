@@ -206,7 +206,7 @@ def get_docker_container_details(container_name):
     # 3. Retrieve the last LOG_LINES_TO_FETCH log lines
     try:
         # Using shell=True for potentially cleaner execution on Debian/Docker
-        cmd_logs = f"docker logs --tail {LOG_LINES_TO_FETCH} --timestamps {container_name}"
+        cmd_logs = f"docker logs --tail {LOG_LINES_TO_FETCH} {container_name}"
         
         result = subprocess.run(
             cmd_logs,
