@@ -291,17 +291,17 @@ def get_service_details(service_name, scope="system", username=None):
             cmd_logs = ["sudo", "-u", username, "sh", "-c", shell_command_logs]
 
         except KeyError:
-             details["status"] = "user_not_found_on_system"
-             details["attributes"]["LastLogs"] = f"User '{username}' does not exist on the system."
-             details["attributes"]["MemoryUsage"] = "0.00 MB" 
-             service_memory_cache[f"{service_name}_{username}_user"] = 0.0
-             return details
+            details["status"] = "user_not_found_on_system"
+            details["attributes"]["LastLogs"] = f"User '{username}' does not exist on the system."
+            details["attributes"]["MemoryUsage"] = "0.00 MB" 
+            service_memory_cache[f"{service_name}_{username}_user"] = 0.0
+            return details
         except Exception as e:
-             details["status"] = "user_env_error"
-             details["attributes"]["LastLogs"] = f"Error setting up environment for user '{username}': {e}"
-             details["attributes"]["MemoryUsage"] = "0.00 MB"
-             service_memory_cache[f"{service_name}_{username}_user"] = 0.0
-             return details
+            details["status"] = "user_env_error"
+            details["attributes"]["LastLogs"] = f"Error setting up environment for user '{username}': {e}"
+            details["attributes"]["MemoryUsage"] = "0.00 MB"
+            service_memory_cache[f"{service_name}_{username}_user"] = 0.0
+            return details
 
     # Default memory value: 0.0 MiB, updated only if running/found
     mem_mib = 0.0 
@@ -333,6 +333,9 @@ def get_service_details(service_name, scope="system", username=None):
                 
         elif active_state in ["inactive", "failed"]:
             details["status"] = "stopped"
+            # Crucial check: If SubState is 'dead' and ActiveState is 'failed', it's genuinely failed.
+            if active_state == "failed":
+                 details["status"] = "failed"
         else:
             details["status"] = active_state
             
@@ -367,13 +370,13 @@ def get_service_details(service_name, scope="system", username=None):
     # Memory logic (Robust: uses mem_mib which is 0.0 unless successfully retrieved above)
     cache_key = f"{service_name}_{scope}"
     if scope == "user" and username:
-         cache_key = f"{service_name}_{username}_user"
-         
+        cache_key = f"{service_name}_{username}_user"
+            
     details["attributes"]["MemoryUsage"] = f"{mem_mib:.2f} MB"
 
     service_memory_cache[cache_key] = mem_mib
 
-    # Logs ophalen
+    # Fetch logs
     try:
         log_output = subprocess.check_output(
             cmd_logs,
@@ -384,7 +387,7 @@ def get_service_details(service_name, scope="system", username=None):
         )
         details["attributes"]["LastLogs"] = log_output.strip()
     except Exception:
-        if details["status"] not in ["not_found", "error"]:
+        if details["status"] not in ["not_found", "error", "user_not_found_on_system", "user_env_error"]:
             details["attributes"]["LastLogs"] = "Logs could not be retrieved (journalctl error)."
 
     return details
@@ -415,12 +418,38 @@ def collect_all_service_details():
 def publish_auto_discovery(client):
     """
     Publishes Home Assistant MQTT Auto Discovery configuration for all
-    individual service and docker sensors.
+    individual service and docker sensors, AND the global failed counter.
     """
     if not MONITORED_SERVICES and not MONITORED_USER_SERVICES and not MONITORED_DOCKER_CONTAINERS:
         return
 
     print("Publishing Home Assistant Auto Discovery configurations...")
+
+    total_entities = 0
+
+    # --- 1. Global Failed Services/Docker Counter Sensor ---
+    topic_failed = f"homeassistant/sensor/{SERVER_NAME}_failed_services_count/config"
+    payload_failed = {
+        "name": f"{SERVER_NAME.capitalize()} Failed Services Count",
+        "state_topic": f"{MQTT_BASE_TOPIC}/failed_services_count",
+        "value_template": "{{ value_json.count }}",
+        "icon": "mdi:alert-circle",
+        "unique_id": f"{SERVER_NAME}_failed_services_count",
+        "object_id": f"{SERVER_NAME}_failed_services_count",
+        "json_attributes_template": "{{ value_json.attributes | tojson }}",
+        "json_attributes_topic": f"{MQTT_BASE_TOPIC}/failed_services_count",
+        "retain": True,
+        "device": {
+            "identifiers": [SERVER_NAME],
+            "name": SERVER_NAME,
+            "manufacturer": "Linux/Docker Monitor",
+            "model": "MQTT Service Watcher",
+        }
+    }
+    client.publish(topic_failed, json.dumps(payload_failed), retain=True)
+    total_entities += 1
+    
+    # --- 2. Individual Service/Docker Sensors ---
 
     def create_discovery_payload(name, scope, icon, username=None, is_memory_sensor=False):
         
@@ -492,7 +521,6 @@ def publish_auto_discovery(client):
         [(c, "docker", None, "mdi:docker") for c in MONITORED_DOCKER_CONTAINERS]
     )
 
-    total_entities = 0
     for name, scope, username, icon in all_monitored_entities:
         # 1. Status/Attribute Sensor
         payload_status = create_discovery_payload(name, scope, icon, username, is_memory_sensor=False)
@@ -511,11 +539,13 @@ def publish_auto_discovery(client):
 
 
 def publish_current_data(client, all_details):
-    """Publishes the current status and attributes, and memory data to MQTT."""
+    """Publishes the current status and attributes, memory data, and the failed services count to MQTT."""
     
     print(f"Publishing {len(all_details)} services/containers data to MQTT...")
     
-    # Publish main status and attributes
+    failed_entities = []
+    
+    # Publish main status and attributes for individual entities
     for key, data in all_details.items():
         # key is like 'service_system' or 'container_docker'
         
@@ -526,10 +556,22 @@ def publish_current_data(client, all_details):
         
         if scope == "docker":
             topic_suffix = "_docker"
-            cache_key = name 
+            cache_key = name  # Docker memory cache uses container name as key
+            display_name = f"Docker: {name}"
+            # A Docker container is considered 'failed' if status is not 'running' or 'stopped' (e.g., 'not_found', 'error', 'restarting', etc.)
+            # We explicitly check for 'running' and 'stopped' (exited/dead from inspect) as success/intentional stop.
+            # Any other state ('unknown', 'error', 'not_found') is considered an issue to report in the counter.
+            is_failed = data["status"] not in ["running", "stopped"]
         else:
             topic_suffix = f"_{username}_user" if scope == "user" else ""
-            cache_key = f"{name}_{username}_user" if scope == "user" else f"{name}_system"
+            cache_key = f"{name}_{username}_user" if scope == "user" else f"{name}_system" # Service memory cache uses scoped key
+            display_name = f"Systemd ({scope}): {name}"
+            # A systemd service is considered 'failed' if status is 'failed'
+            is_failed = data["status"] == "failed"
+            
+        if is_failed:
+             failed_entities.append(display_name)
+
 
         base_topic = f"{MQTT_BASE_TOPIC}/{name}{topic_suffix}"
         
@@ -547,6 +589,21 @@ def publish_current_data(client, all_details):
                 # Publish as a raw float/string value
                 client.publish(topic_mem, f"{mem_value:.2f}", retain=True)
                 
+    # --- 3. Publish Global Failed Services Count ---
+    failed_count = len(failed_entities)
+    failed_topic = f"{MQTT_BASE_TOPIC}/failed_services_count"
+    
+    failed_payload = {
+        "count": failed_count,
+        "attributes": {
+            "failed_entities": failed_entities,
+            "last_updated": datetime.now(timezone.utc).isoformat().split('.')[0] + '+00:00'
+        }
+    }
+    
+    client.publish(failed_topic, json.dumps(failed_payload), retain=True)
+    print(f"Published failed services count: {failed_count} failures found.")
+
 
 # --- Main Logic ---
 
@@ -607,7 +664,7 @@ def main():
             # 2. Collect all docker container details
             docker_details = collect_all_docker_details()
             
-            # 3. Combine and publish
+            # 3. Combine and publish, including the failed services count logic
             all_details = {**service_details, **docker_details}
             publish_current_data(client, all_details)
 
