@@ -3,7 +3,9 @@ for system services and services of the user running the script.
 
 <img width="388" height="676" alt="image" src="https://github.com/user-attachments/assets/90e7cfa6-ede2-457e-807a-5670adea1cc1" />
 
+debian install
 
+`apt install python3-paho-mqtt python3-dotenv python3-dateutil`
 
 dynamic card to show failing services. (replace doorman with the name of your server)
 ```
