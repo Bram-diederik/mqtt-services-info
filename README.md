@@ -1,7 +1,8 @@
 a python script to send service and docker container infomation to home assistant.
 
 
-<img width="388" height="676" alt="image" src="https://github.com/user-attachments/assets/90e7cfa6-ede2-457e-807a-5670adea1cc1" />
+<img width="401" height="930" alt="image" src="https://github.com/user-attachments/assets/bb371c9a-865c-4a25-b1a6-05c08eca72d5" />
+
 
 debian install
 
