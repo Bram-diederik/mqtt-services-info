@@ -20,12 +20,20 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
 MQTT_USER = os.getenv("MQTT_USER")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
 SERVER_NAME = os.getenv("SERVER_NAME", socket.gethostname())
-# Check if SSL is enabled
 MQTT_SSL = os.getenv("MQTT_SSL", "0") == "1"
+UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", 60)) 
+MEM_SENSORS = os.getenv("MEM_SENSORS", "0") == "1" 
 
 # Read both system and user services from the environment file, filtering empty entries
 MONITORED_SERVICES = [s.strip() for s in os.getenv("MONITORED_SERVICES", "").split(',') if s.strip()]
 MONITORED_USER_SERVICES_RAW = [s.strip() for s in os.getenv("MONITORED_USER_SERVICES", "").split(',') if s.strip()]
+
+# The base MQTT topic path for all service data
+MQTT_BASE_TOPIC = f"{SERVER_NAME}/service"
+
+# Global dictionary to store the last collected memory values for publishing
+# Key: 'service_name_scope' -> Value: 'memory_in_mib'
+service_memory_cache = {} 
 
 # Parse user services: 'user:service' or 'service' -> (service, user)
 def parse_user_services(raw_list):
@@ -61,8 +69,6 @@ def parse_user_services(raw_list):
 # The processed list of user services: [(service_name, username), ...]
 MONITORED_USER_SERVICES = parse_user_services(MONITORED_USER_SERVICES_RAW)
 
-# The base MQTT topic path for all service data
-MQTT_BASE_TOPIC = f"{SERVER_NAME}/service"
 
 # --- Core Functions: Service Details Retrieval ---
 
@@ -179,7 +185,17 @@ def get_service_details(service_name, scope="system", username=None):
         mem_bytes = systemctl_data.get("MemoryCurrent", None)
         if mem_bytes and mem_bytes.isdigit():
             # Convert bytes to megabytes (MiB)
-            details["attributes"]["MemoryUsage"] = f"{int(mem_bytes) / (1024*1024):.2f} MB"
+            mem_mib = int(mem_bytes) / (1024*1024)
+            details["attributes"]["MemoryUsage"] = f"{mem_mib:.2f} MB"
+            
+            # --- Cache the memory value for the dedicated sensor ---
+            global service_memory_cache
+            cache_key = f"{service_name}_{scope}"
+            if scope == "user" and username:
+                 cache_key = f"{service_name}_{username}_user"
+
+            service_memory_cache[cache_key] = mem_mib
+            # -----------------------------------------------------------
         else:
             details["attributes"]["MemoryUsage"] = "N/A"
 
@@ -243,48 +259,77 @@ def publish_auto_discovery(client):
 
     print("Publishing Home Assistant Auto Discovery configurations...")
 
-    def create_discovery_payload(service_name, scope, icon="mdi:watch", username=None):
-        # The state topic MUST be unique for user/system services
-        topic_suffix = f"_{username}_user" if scope == "user" else ""
+    def create_discovery_payload(service_name, scope, icon="mdi:watch", username=None, is_memory_sensor=False):
         
-        # Unique identifier used by Home Assistant for internal entity tracking
-        unique_id_slug = f"{SERVER_NAME}_{service_name}_{username}_{scope}" if scope == "user" else f"{SERVER_NAME}_{service_name}_{scope}"
-
-        # Entity ID (name presented to the user): e.g., sensor.myserver_service_daft_user
-        object_id = f"{SERVER_NAME}_service_{service_name}_{username}_user" if scope == "user" else f"{SERVER_NAME}_service_{service_name}_system"
-
+        # Determine unique identifiers
+        topic_suffix = f"_{username}_user" if scope == "user" else ""
+        service_id_part = f"{service_name}_{username}" if scope == "user" else service_name
         name_suffix = f" ({username.capitalize()})" if scope == "user" else ""
-
-        return {
-            "name": f"{service_name.capitalize()} Service{name_suffix}",
-            "state_topic": f"{MQTT_BASE_TOPIC}/{service_name}{topic_suffix}",
-            "value_template": "{{ value_json.status }}",
-            "icon": icon,
-            "unique_id": unique_id_slug,
-            "object_id": object_id,
-            "json_attributes_template": "{{ value_json.attributes | tojson }}",
-            "json_attributes_topic": f"{MQTT_BASE_TOPIC}/{service_name}{topic_suffix}",
-            "device": {
-                "identifiers": [SERVER_NAME],
-                "name": SERVER_NAME,
-                "manufacturer": "Linux Service Monitor",
-                "model": "MQTT Service Watcher",
+        
+        # Sensor specific configuration
+        if is_memory_sensor:
+            unique_id_slug = f"{SERVER_NAME}_mem_service_{service_id_part}_{scope}"
+            object_id = f"{SERVER_NAME}_mem_service_{service_id_part}"
+            name = f"{service_name.capitalize()} Memory{name_suffix}"
+            state_topic = f"{MQTT_BASE_TOPIC}/{service_name}{topic_suffix}/memory" 
+            
+            payload = {
+                "name": name,
+                "state_topic": state_topic,
+                "unit_of_measurement": "MiB",
+                "icon": "mdi:memory",
+                "device_class": "data_size",
+                "unique_id": unique_id_slug,
+                "object_id": object_id,
             }
+        else:
+            unique_id_slug = f"{SERVER_NAME}_{service_name}_{username}_{scope}" if scope == "user" else f"{SERVER_NAME}_{service_name}_{scope}"
+            object_id = f"{SERVER_NAME}_service_{service_name}_{username}_user" if scope == "user" else f"{SERVER_NAME}_service_{service_name}_system"
+            state_topic = f"{MQTT_BASE_TOPIC}/{service_name}{topic_suffix}"
+            
+            payload = {
+                "name": f"{service_name.capitalize()} Service{name_suffix}",
+                "state_topic": state_topic,
+                "value_template": "{{ value_json.status }}",
+                "icon": icon,
+                "unique_id": unique_id_slug,
+                "object_id": object_id,
+                "json_attributes_template": "{{ value_json.attributes | tojson }}",
+                "json_attributes_topic": state_topic,
+            }
+
+        # Common Device Information
+        payload["device"] = {
+            "identifiers": [SERVER_NAME],
+            "name": SERVER_NAME,
+            "manufacturer": "Linux Service Monitor",
+            "model": "MQTT Service Watcher",
         }
+        
+        return payload
 
-    # Discovery for System Services
-    for service in MONITORED_SERVICES:
-        payload = create_discovery_payload(service, "system", "mdi:cogs")
-        discovery_topic = f"homeassistant/sensor/{payload['unique_id']}/config"
-        client.publish(discovery_topic, json.dumps(payload), retain=True)
+    # Consolidated list of all monitored services (system and user)
+    all_monitored_services = (
+        [(s, "system", None) for s in MONITORED_SERVICES] +
+        [(s, "user", u) for s, u in MONITORED_USER_SERVICES]
+    )
 
-    # Discovery for User Services
-    for service_name, username in MONITORED_USER_SERVICES:
-        payload = create_discovery_payload(service_name, "user", "mdi:account-circle", username)
-        discovery_topic = f"homeassistant/sensor/{payload['unique_id']}/config"
-        client.publish(discovery_topic, json.dumps(payload), retain=True)
-
-    # Discovery for Failed Services Count Sensor
+    total_entities = 0
+    for service, scope, username in all_monitored_services:
+        # 1. Publish Status Sensor
+        payload_status = create_discovery_payload(service, scope, "mdi:cogs" if scope == "system" else "mdi:account-circle", username, is_memory_sensor=False)
+        discovery_topic_status = f"homeassistant/sensor/{payload_status['unique_id']}/config"
+        client.publish(discovery_topic_status, json.dumps(payload_status), retain=True)
+        total_entities += 1
+        
+        # 2. Publish Memory Sensor (if enabled)
+        if MEM_SENSORS:
+            payload_mem = create_discovery_payload(service, scope, username=username, is_memory_sensor=True)
+            discovery_topic_mem = f"homeassistant/sensor/{payload_mem['unique_id']}/config"
+            client.publish(discovery_topic_mem, json.dumps(payload_mem), retain=True)
+            total_entities += 1
+            
+    # Discovery for Failed Services Count Sensor (Geen wijziging)
     failed_sensor_id = f"{SERVER_NAME}_failed_services_count"
     failed_sensor_topic = f"homeassistant/sensor/{failed_sensor_id}/config"
     failed_payload = {
@@ -305,14 +350,15 @@ def publish_auto_discovery(client):
         }
     }
     client.publish(failed_sensor_topic, json.dumps(failed_payload), retain=True)
+    total_entities += 1
 
-    print(f"Auto Discovery complete. {len(MONITORED_SERVICES) + len(MONITORED_USER_SERVICES)} entities configured.")
+    print(f"Auto Discovery complete. {total_entities} entities configured.")
 
 
 def publish_values(client):
     """
     Retrieves all service details, publishes the full JSON payloads to MQTT,
-    and updates the failed service counter.
+    updates the failed service counter, and publishes the memory values.
     """
 
     all_details = collect_all_service_details()
@@ -332,10 +378,14 @@ def publish_values(client):
             username = details["username"]
             topic_suffix = f"_{username}_user"
             service_display = f"{service} (user:{username})"
+            # Use the full key for memory cache lookup
+            mem_cache_key = key 
         else:
             topic_suffix = ""
             service_display = f"{service} (system)"
+            mem_cache_key = key
 
+        # --- 1. Publish Status/Attribute Sensor (Main Sensor) ---
         topic = f"{MQTT_BASE_TOPIC}/{service}{topic_suffix}"
 
         # Track failed/stopped services for the counter sensor
@@ -358,7 +408,22 @@ def publish_values(client):
 
         client.publish(topic, json_payload, retain=True)
 
-    # --- Publish Failed Services Count Sensor ---
+        # --- 2. Publish Memory Sensor Value (Separate Sensor) ---
+        if MEM_SENSORS:
+            mem_topic = f"{topic}/memory"
+            mem_value = service_memory_cache.get(mem_cache_key)
+            
+            if mem_value is not None:
+                # Value is a float (MiB), publish it directly as the state payload
+                client.publish(mem_topic, f"{mem_value:.2f}", retain=True)
+                print(f"  Memory: {mem_value:.2f} MiB -> Topic: {mem_topic}")
+            else:
+                # Publish 'unavailable' if value is not set (e.g., service stopped or error)
+                client.publish(mem_topic, "unavailable", retain=True)
+                print(f"  Memory: Unavailable -> Topic: {mem_topic}")
+
+
+    # --- 3. Publish Failed Services Count Sensor ---
     failed_count_payload = {
         "count": len(failed_services),
         "attributes": {
@@ -382,11 +447,15 @@ def main():
     print(f"Server Hostname: {SERVER_NAME}")
     print(f"MQTT Broker: {MQTT_BROKER}:{MQTT_PORT}")
     print(f"Secure Connection (TLS): {'Yes' if MQTT_SSL else 'No'}")
-    print(f"Base Topic Path: {MQTT_BASE_TOPIC}/<service>[_<user>_user]")
+    print(f"Base Topic Path (Services): {MQTT_BASE_TOPIC}/<service>[_<user>_user]")
+    
+    print(f"Update Interval: {UPDATE_INTERVAL} seconds") # Print the interval
     
     user_services_list = [f'{u}:{s}' if ':' not in s else s for s, u in MONITORED_USER_SERVICES]
     print(f"Monitored Services (System): {', '.join(MONITORED_SERVICES) if MONITORED_SERVICES else 'None'}")
     print(f"Monitored Services (User): {', '.join(user_services_list) if user_services_list else 'None'}")
+    print(f"Service Memory Sensors (Home Assistant): {'Enabled' if MEM_SENSORS else 'Disabled'}")
+
 
     # Initialize MQTT Client (using VERSION1 for compatibility with older paho-mqtt/Debian)
     client = mqtt.Client(
@@ -426,7 +495,7 @@ def main():
     try:
         while True:
             publish_values(client)
-            time.sleep(20) # Wait 20 seconds before the next check
+            time.sleep(UPDATE_INTERVAL) 
     except KeyboardInterrupt:
         print("\nScript terminated by user (KeyboardInterrupt).")
     finally:
@@ -442,7 +511,7 @@ if __name__ == "__main__":
             print("User services (MONITORED_USER_SERVICES) are configured, but the script is not running as root.")
             print("The 'sudo -u <username>' command will fail unless you run this script via 'sudo python3 your_script.py'.")
             print("-----------------")
-            time.sleep(2) # Pause briefly to ensure the message is seen
+            time.sleep(2) 
 
         main()
     except Exception as e:
