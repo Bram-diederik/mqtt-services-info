@@ -1,13 +1,30 @@
 # MQTT Broker Details
-MQTT_BROKER=homeassistant
+MQTT_BROKER=homeassistant.lan
 MQTT_PORT=1883
 MQTT_USER=user
 MQTT_PASSWORD=password
-MQTT_SSL=0
-SERVER_NAME=server_name
 
-MONITORED_SERVICES=ssh,nginx
-MONITORED_USER_SERVICES=user:snapclient
-MONITORED_DOCKER_CONTAINERS=esphome
+#SSL on(1) or off(0) 
+MQTT_SSL=0
+
+SERVER_NAME=server_name
+#update in seconds
 UPDATE_INTERVAL=60
+
+#montor system service
+MONITORED_SERVICES=ssh,nginx
+#montor user services 
+MONITORED_USER_SERVICES=<username>:snapclient
+
+#montor docker containers
+MONITORED_DOCKER_CONTAINERS=esphome
+
+#enable memory sensors
 MEM_SENSORS=1
+#Mark stopped as error
+ERROR_ON_STOPPED=0
+
+#logs in attribute
+LOG_LINES_DEFAULT=2
+#Logs when in failure
+LOG_LINES_ON_FAILURE=20

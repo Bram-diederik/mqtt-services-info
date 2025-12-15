@@ -192,9 +192,13 @@ def get_docker_container_details(container_name):
     except subprocess.CalledProcessError:
         details["status"] = "not_found"
         details["attributes"]["LastLogs"] = "Container not found or Docker not running."
+        details["attributes"]["LastLine"] = "Container not found or Docker not running."
+
     except Exception:
         details["status"] = "error"
         details["attributes"]["LastLogs"] = "General error retrieving Docker details."
+        details["attributes"]["LastLine"] = "General error retrieving Docker details."
+
         pass
         
     # 2. Add Memory Usage (Robust logic: uses mem_mib which is 0.0 unless successfully retrieved)
@@ -223,13 +227,17 @@ def get_docker_container_details(container_name):
             log_output = result.stderr.strip()
             
         details["attributes"]["LastLogs"] = log_output
-        
+        details["attributes"]["LastLine"] = extract_last_log_line(log_output)
+
     except subprocess.CalledProcessError as e:
         error_message = e.stderr.strip() if e.stderr else "Unknown Docker logs error."
         details["attributes"]["LastLogs"] = f"Logs could not be retrieved. Error: {error_message}"
+        details["attributes"]["LastLine"] =  f"Logs could not be retrieved. Error: {error_message}"
     except Exception as e:
         if details["status"] not in ["not_found", "error"]:
             details["attributes"]["LastLogs"] = f"General error retrieving logs: {e}"
+            details["attributes"]["LastLine"] = f"General error retrieving logs: {e}"
+
         
     return details
 
@@ -293,12 +301,14 @@ def get_service_details(service_name, scope="system", username=None):
         except KeyError:
             details["status"] = "user_not_found_on_system"
             details["attributes"]["LastLogs"] = f"User '{username}' does not exist on the system."
+            details["attributes"]["LastLine"] = f"User '{username}' does not exist on the system."
             details["attributes"]["MemoryUsage"] = "0.00 MB" 
             service_memory_cache[f"{service_name}_{username}_user"] = 0.0
             return details
         except Exception as e:
             details["status"] = "user_env_error"
             details["attributes"]["LastLogs"] = f"Error setting up environment for user '{username}': {e}"
+            details["attributes"]["LastLine"] = f"Error setting up environment for user '{username}': {e}"
             details["attributes"]["MemoryUsage"] = "0.00 MB"
             service_memory_cache[f"{service_name}_{username}_user"] = 0.0
             return details
@@ -362,9 +372,11 @@ def get_service_details(service_name, scope="system", username=None):
     except subprocess.CalledProcessError:
         details["status"] = "not_found"
         details["attributes"]["LastLogs"] = "Unit could not be found or accessed."
+        details["attributes"]["LastLine"] = "Unit could not be found or accessed."
     except Exception:
         details["status"] = "error"
         details["attributes"]["LastLogs"] = "General error retrieving details."
+        details["attributes"]["LastLine"] = "General error retrieving details."
         pass
 
     # Memory logic (Robust: uses mem_mib which is 0.0 unless successfully retrieved above)
@@ -386,9 +398,12 @@ def get_service_details(service_name, scope="system", username=None):
             encoding='utf-8'
         )
         details["attributes"]["LastLogs"] = log_output.strip()
+        details["attributes"]["LastLine"] = extract_last_log_line(log_output)
+
     except Exception:
         if details["status"] not in ["not_found", "error", "user_not_found_on_system", "user_env_error"]:
             details["attributes"]["LastLogs"] = "Logs could not be retrieved (journalctl error)."
+            details["attributes"]["LastLine"] = "Logs could not be retrieved (journalctl error)."
 
     return details
 
@@ -411,6 +426,63 @@ def collect_all_service_details():
         all_details[key] = details
 
     return all_details
+
+
+# --- Last log ---
+
+def extract_last_log_line(log_text):
+    """
+    Extract the last non-empty log message and aggressively strip
+    known timestamp and log-prefix formats while preserving content.
+    """
+    if not log_text:
+        return ""
+
+    lines = [l.strip() for l in log_text.splitlines() if l.strip()]
+    if not lines:
+        return ""
+
+    line = lines[-1]
+
+    patterns = [
+
+        # --- ISO 8601 / RFC3339 ---
+        r'^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\s*',
+
+        # --- Docker / JSON style ---
+        r'^\[\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?\]\s*',
+
+        # --- Frigate / double timestamps ---
+        r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+\s+',
+        r'^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]\s*',
+
+        # --- journalctl / syslog ---
+        r'^[A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\S+\s+\S+?:\s*',
+
+        # --- rsyslog with year ---
+        r'^\d{4}\s+[A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+',
+
+        # --- Kubernetes / containerd ---
+        r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z\s+',
+
+        # --- Python logging ---
+        r'^\[\w+\]\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2},\d+\s+-\s+',
+
+        # --- Go / Rust structured logs ---
+        r'^(INFO|WARN|ERROR|DEBUG|TRACE)\s+\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}\s+',
+
+        # --- Remaining severity prefixes ---
+        r'^(INFO|WARN|WARNING|ERROR|DEBUG|TRACE|NOTICE|CRITICAL)\s*[:\-]\s*',
+
+        # --- logger/service prefixes ---
+        r'^[A-Za-z0-9_.\-\/]+\[\d+\]:\s*',
+        r'^[A-Za-z0-9_.\-\/]+:\s*',
+    ]
+
+    for pattern in patterns:
+        line = re.sub(pattern, '', line).strip()
+
+    return line
 
 
 # --- Publish/Discovery Functions ---
