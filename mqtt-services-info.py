@@ -26,7 +26,6 @@ UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", 60))
 MEM_SENSORS = os.getenv("MEM_SENSORS", "0") == "1" 
 
 # --- Log Settings ---
-# Fetch the last 2 log lines for both Docker and systemd
 LOG_LINES_TO_FETCH = 2 
 
 # Read and filter monitored entities from environment variables
@@ -34,8 +33,8 @@ MONITORED_SERVICES = [s.strip() for s in os.getenv("MONITORED_SERVICES", "").spl
 MONITORED_USER_SERVICES_RAW = [s.strip() for s in os.getenv("MONITORED_USER_SERVICES", "").split(',') if s.strip()]
 MONITORED_DOCKER_CONTAINERS = [c.strip() for c in os.getenv("MONITORED_DOCKER_CONTAINERS", "").split(',') if c.strip()]
 
-# The base MQTT topic path for all monitor data
-MQTT_BASE_TOPIC = f"{SERVER_NAME}/monitor" 
+# The base MQTT topic path for all monitor data - CHANGED to use server_name_services
+MQTT_BASE_TOPIC = f"{SERVER_NAME}_services" 
 
 # Global dictionaries to store the last collected memory values for publishing
 service_memory_cache = {} 
@@ -445,7 +444,6 @@ def extract_last_log_line(log_text):
     line = lines[-1]
 
     patterns = [
-
         # --- ISO 8601 / RFC3339 ---
         r'^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\s*',
 
@@ -487,6 +485,73 @@ def extract_last_log_line(log_text):
 
 # --- Publish/Discovery Functions ---
 
+def create_discovery_payload(name, scope, icon, username=None, is_memory_sensor=False):
+    """Creates MQTT discovery payload for Home Assistant."""
+    
+    sanitized_name = sanitize_for_ha_id(name)
+    
+    if scope == "docker":
+        unique_slug = "container"
+        name_prefix = "Container"
+        name_suffix = " (Docker)"
+        topic_suffix = "_docker"
+        service_id_part = f"{sanitized_name}_docker"
+    else: # system or user
+        unique_slug = "service"
+        name_prefix = "Service"
+        name_suffix = f" ({username.capitalize()})" if scope == "user" else ""
+        topic_suffix = f"_{username}_user" if scope == "user" else ""
+        service_id_part = f"{sanitized_name}_{username}" if scope == "user" else sanitized_name
+    
+    base_topic = f"{MQTT_BASE_TOPIC}/{name}{topic_suffix}"
+    
+    if is_memory_sensor:
+        unique_id_slug = f"{SERVER_NAME}_mem_{unique_slug}_{service_id_part}" 
+        object_id = f"{SERVER_NAME}_mem_{unique_slug}_{service_id_part}"
+        name_display = f"{name.capitalize()} {name_prefix} Memory{name_suffix}"
+        state_topic = f"{base_topic}/memory" 
+        
+        # Fixed: Proper Home Assistant discovery payload for memory sensor
+        payload = {
+            "name": name_display,
+            "state_topic": state_topic,
+            "unit_of_measurement": "MiB",  # Use "MiB" for mebibytes
+            "icon": "mdi:memory",
+            "device_class": "data_size",  # This tells HA it's a data size sensor
+            "state_class": "measurement",  # Important for statistics
+            "unique_id": unique_id_slug,
+            "object_id": object_id,
+            "retain": True,
+        }
+    else:
+        unique_id_slug = f"{SERVER_NAME}_{unique_slug}_{service_id_part}" 
+        object_id = f"{SERVER_NAME}_{unique_slug}_{service_id_part}"
+        
+        name_display = f"{name.capitalize()} {name_prefix}{name_suffix}"
+        state_topic = base_topic
+        
+        payload = {
+            "name": name_display,
+            "state_topic": state_topic,
+            "value_template": "{{ value_json.status }}",
+            "icon": icon,
+            "unique_id": unique_id_slug,
+            "object_id": object_id,
+            "json_attributes_template": "{{ value_json.attributes | tojson }}",
+            "json_attributes_topic": state_topic,
+            "retain": True,
+        }
+
+    payload["device"] = {
+        "identifiers": [f"{SERVER_NAME}_services"],
+        "name": f"{SERVER_NAME} Services",
+        "manufacturer": "Linux/Docker Monitor",
+        "model": "MQTT Service Watcher",
+    }
+    
+    return payload
+
+
 def publish_auto_discovery(client):
     """
     Publishes Home Assistant MQTT Auto Discovery configuration for all
@@ -512,8 +577,8 @@ def publish_auto_discovery(client):
         "json_attributes_topic": f"{MQTT_BASE_TOPIC}/failed_services_count",
         "retain": True,
         "device": {
-            "identifiers": [SERVER_NAME],
-            "name": SERVER_NAME,
+            "identifiers": [f"{SERVER_NAME}_services"],
+            "name": f"{SERVER_NAME} Services",
             "manufacturer": "Linux/Docker Monitor",
             "model": "MQTT Service Watcher",
         }
@@ -522,70 +587,6 @@ def publish_auto_discovery(client):
     total_entities += 1
     
     # --- 2. Individual Service/Docker Sensors ---
-
-    def create_discovery_payload(name, scope, icon, username=None, is_memory_sensor=False):
-        
-        sanitized_name = sanitize_for_ha_id(name)
-        
-        if scope == "docker":
-            unique_slug = "container"
-            name_prefix = "Container"
-            name_suffix = " (Docker)"
-            topic_suffix = "_docker"
-            service_id_part = f"{sanitized_name}_docker"
-        else: # system or user (Retain 'service' slug for existing entities)
-            unique_slug = "service"
-            name_prefix = "Service"
-            name_suffix = f" ({username.capitalize()})" if scope == "user" else ""
-            topic_suffix = f"_{username}_user" if scope == "user" else ""
-            service_id_part = f"{sanitized_name}_{username}" if scope == "user" else sanitized_name
-        
-        
-        base_topic = f"{MQTT_BASE_TOPIC}/{name}{topic_suffix}"
-        
-        if is_memory_sensor:
-            unique_id_slug = f"{SERVER_NAME}_mem_{unique_slug}_{service_id_part}" 
-            object_id = f"{SERVER_NAME}_mem_{unique_slug}_{service_id_part}"
-            name_display = f"{name.capitalize()} {name_prefix} Memory{name_suffix}"
-            state_topic = f"{base_topic}/memory" 
-            
-            payload = {
-                "name": name_display,
-                "state_topic": state_topic,
-                "unit_of_measurement": "MiB",
-                "icon": "mdi:memory",
-                "device_class": "data_size",
-                "unique_id": unique_id_slug,
-                "object_id": object_id,
-                "retain": True,
-            }
-        else:
-            unique_id_slug = f"{SERVER_NAME}_{unique_slug}_{service_id_part}" 
-            object_id = f"{SERVER_NAME}_{unique_slug}_{service_id_part}"
-            
-            name_display = f"{name.capitalize()} {name_prefix}{name_suffix}"
-            state_topic = base_topic
-            
-            payload = {
-                "name": name_display,
-                "state_topic": state_topic,
-                "value_template": "{{ value_json.status }}",
-                "icon": icon,
-                "unique_id": unique_id_slug,
-                "object_id": object_id,
-                "json_attributes_template": "{{ value_json.attributes | tojson }}",
-                "json_attributes_topic": state_topic,
-                "retain": True,
-            }
-
-        payload["device"] = {
-            "identifiers": [SERVER_NAME],
-            "name": SERVER_NAME,
-            "manufacturer": "Linux/Docker Monitor",
-            "model": "MQTT Service Watcher",
-        }
-        
-        return payload
 
     all_monitored_entities = (
         [(s, "system", None, "mdi:cogs") for s in MONITORED_SERVICES] +
@@ -630,20 +631,17 @@ def publish_current_data(client, all_details):
             topic_suffix = "_docker"
             cache_key = name  # Docker memory cache uses container name as key
             display_name = f"Docker: {name}"
-            # A Docker container is considered 'failed' if status is not 'running' or 'stopped' (e.g., 'not_found', 'error', 'restarting', etc.)
-            # We explicitly check for 'running' and 'stopped' (exited/dead from inspect) as success/intentional stop.
-            # Any other state ('unknown', 'error', 'not_found') is considered an issue to report in the counter.
+            # A Docker container is considered 'failed' if status is not 'running' or 'stopped'
             is_failed = data["status"] not in ["running", "stopped"]
         else:
             topic_suffix = f"_{username}_user" if scope == "user" else ""
-            cache_key = f"{name}_{username}_user" if scope == "user" else f"{name}_system" # Service memory cache uses scoped key
+            cache_key = f"{name}_{username}_user" if scope == "user" else f"{name}_system"
             display_name = f"Systemd ({scope}): {name}"
             # A systemd service is considered 'failed' if status is 'failed'
             is_failed = data["status"] == "failed"
             
         if is_failed:
              failed_entities.append(display_name)
-
 
         base_topic = f"{MQTT_BASE_TOPIC}/{name}{topic_suffix}"
         
@@ -658,8 +656,11 @@ def publish_current_data(client, all_details):
 
             if mem_value is not None:
                 topic_mem = f"{base_topic}/memory"
-                # Publish as a raw float/string value
-                client.publish(topic_mem, f"{mem_value:.2f}", retain=True)
+                # Fixed: Publish as a raw number (float), not formatted string
+                client.publish(topic_mem, str(mem_value), retain=True)
+            else:
+                # Publish 0 if no memory data available
+                client.publish(topic_mem, "0", retain=True)
                 
     # --- 3. Publish Global Failed Services Count ---
     failed_count = len(failed_entities)
@@ -690,7 +691,8 @@ def on_connect(client, userdata, flags, rc):
 
 def setup_mqtt_client():
     """Initializes and configures the MQTT client."""
-    client = mqtt.Client(client_id=f"service_monitor_{SERVER_NAME}")
+    # CHANGED: Register with client ID as <server_name>_services
+    client = mqtt.Client(client_id=f"{SERVER_NAME}_services")
     client.on_connect = on_connect
     
     if MQTT_USER and MQTT_PASSWORD:
@@ -727,6 +729,8 @@ def main():
     time.sleep(2) 
 
     print(f"Starting service monitoring loop (Update Interval: {UPDATE_INTERVAL} seconds)...")
+    print(f"MQTT base topic: {MQTT_BASE_TOPIC}")
+    print(f"Client ID: {SERVER_NAME}_services")
 
     while True:
         try:
